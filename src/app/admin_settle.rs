@@ -649,6 +649,57 @@ mod handler_tests {
         ));
     }
 
+    /// #809: losing the claim has to stop the handler *before* the settle, and
+    /// say so — a silent `Ok` reports a settle that never happened. The
+    /// interleaving is not deterministically testable, so the miss is injected
+    /// with a `BEFORE UPDATE … RAISE(IGNORE)` trigger on the claim's own
+    /// write, which leaves exactly what losing the race leaves:
+    /// `rows_affected() == 0`. The `preimage` stays `None`, so a settle that
+    /// was reached would surface as `LnNodeError`
+    /// (`dispute_order_reaches_settle_seam`) instead of this refusal.
+    #[tokio::test]
+    async fn a_lost_claim_refuses_before_the_settle() {
+        let pool = setup_pool().await;
+        let ctx = build_ctx(pool.clone());
+        let mut ln = dead_lnd().await;
+        let admin = Keys::generate();
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+
+        let mut order = dispute_order(seller, buyer);
+        order.seller_dispute = true;
+        order.preimage = None;
+        let order = order.create(ctx.pool()).await.unwrap();
+        assign_solver(ctx.pool(), order.id, &admin.public_key()).await;
+        sqlx::query(
+            "CREATE TRIGGER lose_the_claim BEFORE UPDATE ON orders \
+             WHEN new.status = 'settled-hold-invoice' BEGIN SELECT RAISE(IGNORE); END",
+        )
+        .execute(ctx.pool())
+        .await
+        .unwrap();
+
+        let result = admin_settle_action(
+            &ctx,
+            settle_msg(order.id),
+            &admin_event(admin.public_key()),
+            &admin,
+            &mut ln,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(MostroCantDo(CantDoReason::InvalidOrderStatus))),
+            "a lost claim must refuse before the settle, got {result:?}"
+        );
+        let stored = Order::by_id(ctx.pool(), order.id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.status,
+            Status::Dispute.to_string(),
+            "the order must be left to whichever path owns the transition"
+        );
+    }
+
     /// The two transitions `admin_settle_action` drives through
     /// `claim_order_status`: the claim, and its release on a failed settle.
     async fn claim_settle(pool: &SqlitePool, order_id: uuid::Uuid) -> bool {
