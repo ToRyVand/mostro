@@ -114,17 +114,29 @@ pub async fn admin_settle_action(
     };
 
     // #809: claim `Dispute → SettledHoldInvoice` before the settle, so a
-    // losing concurrent handler never reaches LND; a miss means another path
-    // owns the transition, so return `Ok`. The helper's `cashu_escrow_locked_at
-    // IS NULL` predicate never excludes an order here: `dispatch_cashu` refuses
-    // `AdminSettle`, and the admin RPC server and the escrow-deadline job (the
-    // other writer of `Dispute`) are Lightning-only.
+    // losing concurrent handler never reaches LND. A miss means another path
+    // owns the transition.
+    //
+    // The helper's `cashu_escrow_locked_at IS NULL` predicate excludes nothing
+    // here *while* `dispatch_cashu` refuses `AdminSettle` and no locked order
+    // can reach `Dispute` in the same run. Two things end that, and both need
+    // a CAS of their own rather than this helper: TD-3, whose Track D §5C
+    // makes a locked escrow the buyer-wins path here rather than something to
+    // refuse; and a daemon restarted in Lightning mode against a database that
+    // was in Cashu mode — nothing ever clears the lock
+    // (`find_locked_cashu_orders` pins that as deliberate), so such an order
+    // can be disputed and then never admin-settled.
     if !claim_order_status(pool, order.id, Status::Dispute, Status::SettledHoldInvoice).await? {
         tracing::warn!(
             order_id = %order.id,
-            "admin_settle: order transitioned out of dispute concurrently; escrow untouched"
+            "admin_settle: the dispute → settled-hold-invoice claim matched no row; escrow untouched"
         );
-        return Ok(());
+        // Refused rather than `Ok`: a silent `Ok` has the gRPC surface report
+        // a settle that never happened, and leaves a solver on the Nostr path
+        // with no reply. The reason is the one the guard above answers for the
+        // same condition — the order is no longer in `Dispute`, found a moment
+        // later — so a solver that retries is told the same thing twice.
+        return Err(MostroCantDo(CantDoReason::InvalidOrderStatus));
     }
 
     // Settle seller hold invoice
