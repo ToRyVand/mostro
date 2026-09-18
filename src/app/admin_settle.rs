@@ -1,14 +1,13 @@
 use crate::app::bond::{self, BondSlashReason};
 use crate::app::context::AppContext;
+use crate::app::dispute::close_dispute_after_user_resolution;
 use crate::db::{
-    claim_order_status, ensure_dispute_finalize_permission, find_dispute_by_order_id,
-    is_assigned_solver, is_dispute_taken_by_admin,
+    claim_order_status, ensure_dispute_finalize_permission, is_assigned_solver,
+    is_dispute_taken_by_admin,
 };
 use crate::lightning::LndConnector;
-use crate::nip33::{create_dispute_event_tags, new_dispute_event};
 use crate::util::{enqueue_order_msg, get_order, settle_seller_hold_invoice, update_order_event};
 
-use mostro_core::db::Crud;
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 use std::str::FromStr;
@@ -96,9 +95,10 @@ pub async fn admin_settle_action(
     // irreversible: resolving the initiator afterwards meant a rejected
     // request had already moved the escrow, and the early return then also
     // skipped the `AdminSettled` fan-out and the bond resolution below.
-    let dispute_initiator = match (order.seller_dispute, order.buyer_dispute) {
-        (true, false) => "seller",
-        (false, true) => "buyer",
+    // The initiator itself is resolved again by the dispute close below; what
+    // has to happen here is the refusal, before the escrow moves.
+    match (order.seller_dispute, order.buyer_dispute) {
+        (true, false) | (false, true) => {}
         (seller_dispute, buyer_dispute) => {
             // Only reachable through a corrupted row — `dispute_action`
             // gates on `Active`/`FiatSent`, so exactly one flag is set by
@@ -111,7 +111,7 @@ pub async fn admin_settle_action(
             );
             return Err(MostroInternalErr(ServiceError::DisputeEventError));
         }
-    };
+    }
 
     // #809: claim `Dispute → SettledHoldInvoice` before the settle, so a
     // losing concurrent handler never reaches LND. A miss means another path
@@ -158,51 +158,57 @@ pub async fn admin_settle_action(
         return Err(MostroInternalErr(ServiceError::LnNodeError(e.to_string())));
     }
 
-    // The claim already persisted the status; patch only the republished
-    // `event_id` rather than writing back a pre-claim snapshot.
-    let order_updated = update_order_event(my_keys, Status::SettledHoldInvoice, &order)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
-    sqlx::query("UPDATE orders SET event_id = ? WHERE id = ?")
-        .bind(&order_updated.event_id)
-        .bind(order_updated.id)
-        .execute(pool)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
-    // we check if there is a dispute
-    let dispute = find_dispute_by_order_id(pool, order.id).await;
-
-    if let Ok(mut d) = dispute {
-        let dispute_id = d.id;
-        let opened_at = d.created_at;
-        // we update the dispute
-        d.status = DisputeStatus::Settled.to_string();
-        d.update(pool)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
-        // We create a tag to show status of the dispute
-        let tags = create_dispute_event_tags(
-            DisputeStatus::Settled.to_string(),
-            dispute_initiator,
-            opened_at,
-            ctx.settings().mostro.name.as_deref(),
-        );
-
-        // nip33 kind with dispute id as identifier (kind 38386 for disputes)
-        let event = new_dispute_event(my_keys, "", dispute_id.to_string(), tags)
-            .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
-
-        // Print event dispute with update
-        tracing::info!("Dispute event to be published: {event:#?}");
-
-        let client = ctx.nostr_client();
-        if let Err(e) = client.send_event(&event).await {
-            error!("Failed to send dispute settlement event: {}", e);
+    // Past the settle the escrow has moved and the `Dispute` guard rejects a
+    // retry, so nothing below may abort the handler: an early return strands
+    // every `Locked` bond and skips the buyer's payout with no path back.
+    // Everything from here down is therefore best effort — the reason
+    // `admin_cancel` already gives for its own notification fan-out, extended
+    // here to every step that can fail after the money has moved.
+    //
+    // The claim already persisted the status; this only republishes the event
+    // and patches its id.
+    let order_updated = match update_order_event(my_keys, Status::SettledHoldInvoice, &order).await
+    {
+        Ok(updated) => {
+            if let Err(e) = sqlx::query("UPDATE orders SET event_id = ? WHERE id = ?")
+                .bind(&updated.event_id)
+                .bind(updated.id)
+                .execute(pool)
+                .await
+            {
+                error!(
+                    order_id = %order.id,
+                    "admin_settle: could not patch the republished event id: {e}"
+                );
+            }
+            updated
         }
-    }
+        Err(e) => {
+            error!(
+                order_id = %order.id,
+                "admin_settle: could not republish the settled order event: {e}"
+            );
+            // The claim wrote the status, so carry that forward: the payout
+            // and the bond resolution below still need the order.
+            let mut fallback = order.clone();
+            fallback.status = Status::SettledHoldInvoice.to_string();
+            fallback
+        }
+    };
+
+    // Close the dispute row and republish its event through the shared
+    // helper `release_action` and `cancel.rs` already use: it logs a failed
+    // update and steps over it, and publishes only when the row actually
+    // moved, so relays never advertise a settlement the database does not
+    // carry.
+    close_dispute_after_user_resolution(
+        ctx,
+        &order_updated,
+        DisputeStatus::Settled,
+        my_keys,
+        "admin settle",
+    )
+    .await;
 
     // Send message to event creator
     enqueue_order_msg(
@@ -215,31 +221,34 @@ pub async fn admin_settle_action(
     )
     .await;
 
-    // Send message to seller and buyer
-    if let Some(ref seller_pubkey) = order_updated.seller_pubkey {
-        enqueue_order_msg(
-            None,
-            Some(order_updated.id),
-            Action::AdminSettled,
-            None,
-            PublicKey::from_str(seller_pubkey)
-                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?,
-            msg.get_inner_message_kind().trade_index,
-        )
-        .await;
-    }
-    // Send message to buyer
-    if let Some(ref buyer_pubkey) = order_updated.buyer_pubkey {
-        enqueue_order_msg(
-            None,
-            Some(order_updated.id),
-            Action::AdminSettled,
-            None,
-            PublicKey::from_str(buyer_pubkey)
-                .map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))?,
-            msg.get_inner_message_kind().trade_index,
-        )
-        .await;
+    // Send message to seller and buyer. An unparseable pubkey used to abort
+    // the handler here — past the settle, so it stranded the bonds and the
+    // payout below over a notification nobody could receive anyway.
+    for (role, pubkey) in [
+        ("seller", &order_updated.seller_pubkey),
+        ("buyer", &order_updated.buyer_pubkey),
+    ] {
+        match pubkey.as_deref().map(PublicKey::from_str) {
+            Some(Ok(destination)) => {
+                enqueue_order_msg(
+                    None,
+                    Some(order_updated.id),
+                    Action::AdminSettled,
+                    None,
+                    destination,
+                    msg.get_inner_message_kind().trade_index,
+                )
+                .await
+            }
+            Some(Err(_)) => error!(
+                order_id = %order_updated.id,
+                "admin_settle: unparseable {role} pubkey; skipping the settlement notice"
+            ),
+            None => error!(
+                order_id = %order_updated.id,
+                "admin_settle: no {role} pubkey on a settled order; no settlement notice sent"
+            ),
+        }
     }
     // Phase 2: apply the solver's `BondResolution` (release-by-default
     // when absent, otherwise slash the flagged sides). Slashed bonds
